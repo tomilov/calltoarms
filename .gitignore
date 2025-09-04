@@ -1,0 +1,11 @@
+.*.swp
+/*.egg-info/
+/*.pyc
+/build/
+/calltoarms.spec
+/dist/
+/venv/
+__pycache__/
+/*.log.*
+/*.log
+/settings.yaml

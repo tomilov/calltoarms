@@ -1,0 +1,6 @@
+setuptools
+pre-commit
+ruff
+mypy
+pytest
+pyinstaller

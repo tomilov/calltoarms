@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=80.9"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calltoarms"
+version = "0.1.0"
+authors = [
+  { name="Tomilov Anatoliy", email="tomilovanatoliy@gmail.com" },
+]
+description = "Application launcher."
+readme = "README.md"
+license = { text = "CC-PDM-1.0" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Creative Commons Public Domain Mark 1.0 Universal",
+  "Operating System :: Windows",
+]
+requires-python = ">=3.13"
+dependencies = [
+  "PyYAML",
+  "types-PyYAML",
+  "pywin32",
+  "types-pywin32",
+  "psutil",
+  "types-psutil",
+  "pyautogui",
+  "types-PyAutoGUI",
+  "keyboard",
+  "types-keyboard",
+  "opencv-python",
+  "Pillow",
+  "pygetwindow",
+  "aiofiles",
+  "tenacity",
+  "psutil",
+  "types-psutil",
+  "wmi",
+  "flet",
+  "flet-desktop; sys_platform == 'win32'",
+  "filelock",
+  "tabulate",
+  "types-tabulate",
+  "pydantic",
+  "pydantic-settings",
+  "addict",
+]
+
+[project.urls]
+Homepage = "https://tomilov.github.io/calltoarms"
+Documentation = "https://tomilov.github.io/calltoarms/docs"
+Repository = "https://github.com/tomilov/calltoarms.git"
+"Bug Tracker" = "https://github.com/tomilov/calltoarms/issues"
+Changelog = "https://github.com/tomilov/calltoarms/blob/master/CHANGELOG.md"
+
+[project.scripts]
+calltoarms-cli = "calltoarms.cli:main"
+
+[project.gui-scripts]
+calltoarms-gui = "calltoarms.gui:main"
+
+[tool.setuptools.package-data]
+"calltoarms" = [
+  "assets/*",
+  "py.typed",
+]
+
+[tool.ruff]
+include = [
+  "pyproject.toml",
+  "run.py",
+  "src/calltoarms/*.py",
+  "tests/*.py",
+]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+  "ALL",
+]
+ignore = [
+  "ASYNC109",
+  "S101",
+  "COM812",
+  "TRY003",
+  "D",
+  "BLE001",
+  "EM101",
+  "ANN204",
+  "T201",
+  "EM102",
+  "FBT003",
+  "FBT001",
+  "FIX002",
+  "TD003",
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+strict = true
+disallow_untyped_defs = true
+warn_unreachable = true
+disallow_untyped_calls = true

@@ -1,0 +1,74 @@
+name: CI (Windows 32-bit)
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    concurrency:
+      group: ci-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.13 x86
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: 'x86'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements*.txt
+            pyproject.toml
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MSYS
+          install: >
+            make
+            bash
+            coreutils
+            grep
+            zip
+          cache: true
+
+      - name: Expose Windows Python in MSYS2
+        run: |
+          P=$(cygpath -u "$pythonLocation")
+          echo "PYTHON=$P/python.exe" >> "$GITHUB_ENV"
+          "$P/python.exe" --version
+
+      - name: Confirm Python is 32-bit
+        run: |
+          "$PYTHON" --version
+          "$PYTHON" -c "import struct,sys; print('arch:', 8*struct.calcsize('P'), 'bits'); print(sys.executable); assert struct.calcsize('P')*8==32"
+
+      - name: Create venv
+        run: make PYTHON="$PYTHON" venv
+
+      - name: Install dev requirements
+        run: make requirements-dev
+
+      - name: Install package (editable)
+        run: make install-editable
+
+      - name: Lint/format check
+        run: make check
+
+      - name: Run tests
+        run: make test
