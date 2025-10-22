@@ -34,10 +34,13 @@ import win32con
 import winerror
 from addict import Dict  # type: ignore[import-untyped]
 
+from . import util
+
 logger = logging.getLogger(__name__)
 
 
 INT3 = b"\xcc"
+MAX_INSTR_SZ = 8
 
 DWORD64 = ctypes.c_uint64
 SIZE_T = ctypes.c_size_t
@@ -222,8 +225,6 @@ INFINITE = DWORD(-1)
 PROCESS_ALL_ACCESS = 0x1F0FFF
 THREAD_ALL_ACCESS = 0x1F03FF
 
-EXCEPTION_BREAKPOINT = 0x80000003
-
 
 class SOCKADDR_IN(Structure):  # noqa: N801
     _fields_: typing.ClassVar = [
@@ -247,6 +248,9 @@ EXCEPTION_RECORD._fields_ = [
     ("NumberParameters", DWORD),
     ("ExceptionInformation", POINTER(ULONG) * EXCEPTION_MAXIMUM_PARAMETERS),
 ]
+
+EXCEPTION_BREAKPOINT = 0x80000003
+EXCEPTION_SINGLE_STEP = 0x80000004
 
 
 class EXCEPTION_DEBUG_INFO(Structure):  # noqa: N801
@@ -375,6 +379,10 @@ CloseHandle.restype = BOOL
 OpenThread = kernel32.OpenThread
 OpenThread.argtypes = (DWORD, BOOL, DWORD)
 OpenThread.restype = HANDLE
+
+TerminateThread = kernel32.TerminateThread
+TerminateThread.argtypes = (HANDLE, DWORD)
+TerminateThread.restype = BOOL
 
 SuspendThread = kernel32.SuspendThread
 SuspendThread.argtypes = (HANDLE,)
@@ -586,7 +594,7 @@ EFLAGS_TF = 0x100  # EFlags Trap Flag
 
 @dataclass(kw_only=True)
 class Dll:
-    image_file: HANDLE
+    image_file: HANDLE = field(default_factory=HANDLE)
 
 
 @dataclass(kw_only=True)
@@ -606,6 +614,21 @@ class Process:
     image_file: HANDLE = field(default_factory=HANDLE)
     threads: dict[DWORD, HANDLE] = field(default_factory=dict)
     dlls: dict[LPVOID, Dll] = field(default_factory=dict)  # lpBaseOfDll to hFile
+
+    pending_second_break_tids: dict[int, LPVOID] = field(default_factory=dict)
+    pending_single_step_tids: set[int] = field(default_factory=set)
+
+    def cleanup(self) -> None:
+        if self.image_file.value is not None:
+            _check(CloseHandle(self.image_file))
+        with open_process(self.pid) as h_process:
+            while self.pending_second_break_tids:
+                tid, p_if_index_memory = self.pending_second_break_tids.popitem()
+                logger.warning(
+                    "%s",
+                    f"Thread {tid} of process {self.pid} goes to abandoned breakpoint",
+                )
+                free_memory(h_process, p_if_index_memory)
 
 
 def _check[T](condition: T, ex: Exception | None = None, descr: str | None = None) -> T:
@@ -819,7 +842,7 @@ def read_process_memory(h_process: HANDLE, addr: LPVOID, n: int) -> bytes:
     read = SIZE_T(0)
     _check(ReadProcessMemory(h_process, addr, orig_code, n, byref(read)))
     if read.value != n:
-        raise RuntimeError(f"Cannot read original code from process memory: {read = }")
+        raise RuntimeError(f"Cannot read data from process memory: {read = }")
     return bytes(orig_code)
 
 
@@ -898,8 +921,6 @@ class Debugger:
         self.barrier: threading.Barrier = threading.Barrier(2)
         self.lock: threading.Lock = threading.Lock()
         self.events: list[threading.Event] = []
-        self.pending_second_break_tids: dict[int, LPVOID] = {}
-        self.pending_single_step_tids: set[int] = set()
 
     def send(self, **kwargs: typing.Unpack[MessageArgs]) -> tuple[typing.Any, ...]:
         done: threading.Event
@@ -913,6 +934,46 @@ class Debugger:
             self.events.append(msg.done)
         return msg.result
 
+    def setup_process(self, pid: int, token: str, if_index: int) -> Process:
+        with open_process(pid) as h_process:
+            process_bitness = get_process_bitness(h_process)
+            if process_bitness != 32:  # noqa: PLR2004
+                raise RuntimeError(f"{process_bitness}-bit debugee is not supported")
+            threads = psutil.Process(pid=pid).threads()
+            if len(threads) != 1:
+                util.raise_assert(f"{len(threads) = }")
+            tid = threads[0].id
+            with open_thread(tid) as h_thread:
+                process = Process(
+                    pid=pid,
+                    token=token,
+                    if_index=if_index,
+                )
+                dll_name = b"ws2_32.dll"
+                h_module = load_library(h_process, dll_name)
+                (
+                    process.functions.connect,
+                    process.functions.setsockopt,
+                ) = get_export_addresses(h_module, dll_name, b"connect", b"setsockopt")
+                process.h_module[dll_name] = h_module
+                process.orig_code = read_process_memory(
+                    h_process, process.functions.connect, len(INT3)
+                )
+                _check(ResumeThread(h_thread))
+                return process
+
+    def terminate_proc(self, proc: subprocess.Popen[str]) -> None:
+        if proc.returncode is not None:
+            return
+        logger.info("Terminate process...")
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            logger.info("Subprocess exited on its own")
+        else:
+            returncode = proc.wait()
+            logger.info("%s", f"Subprocess terminated: {returncode = }")
+
     def handle_load_dll(self, process: Process, load_dll: LOAD_DLL_DEBUG_INFO) -> None:
         process.dlls[load_dll.lpBaseOfDll] = Dll(image_file=load_dll.hFile)
         dll_name = get_final_path_from_handle(load_dll.hFile)
@@ -925,8 +986,13 @@ class Debugger:
         if dll is not None and dll.image_file.value is not None:
             _check(CloseHandle(dll.image_file))
 
-    def handle_connect_break(self, process: Process, tid: int) -> None:
-        assert process.if_index is not None
+    def handle_connect_break(  # noqa: PLR0915
+        self,
+        process: Process,
+        tid: int,
+        exception_code: int,
+        exception_address: int,
+    ) -> None:
         with (
             open_process(process.pid) as h_process,
             open_thread(tid) as h_thread,
@@ -935,29 +1001,41 @@ class Debugger:
                 assert process.functions.connect.value is not None
                 assert process.functions.setsockopt.value is not None
             ctx = get_context(h_thread)
-            if tid in self.pending_single_step_tids:
+            logger.info("%s", f"{ctx.Eip = :08X} {exception_address = :08X}")
+            if tid in process.pending_single_step_tids:
+                if exception_code != EXCEPTION_SINGLE_STEP:
+                    raise RuntimeError(f"Unknown exception: {exception_code = :08x}")
+                logger.info("[blue]%s[/]", f"Breakpoint #3 [{tid = }]")
                 write_process_memory(h_process, process.functions.connect, INT3)
                 ctx.EFlags &= ~EFLAGS_TF
-                self.pending_single_step_tids.remove(tid)
-            elif tid in self.pending_second_break_tids:
+                process.pending_single_step_tids.remove(tid)
+            elif tid in process.pending_second_break_tids:
+                if exception_code != EXCEPTION_BREAKPOINT:
+                    raise RuntimeError(f"Unknown exception: {exception_code = :08x}")
+                logger.info("[green]%s[/]", f"Breakpoint #2 [{tid = }]")
+                p_if_index_memory = process.pending_second_break_tids.pop(tid)
+                free_memory(h_process, p_if_index_memory)
                 write_process_memory(
                     h_process, process.functions.connect, process.orig_code
                 )
                 ctx.Eip = process.functions.connect.value
                 ctx.EFlags |= EFLAGS_TF  # arm single-step
 
-                logger.info("%s", f"EAX = 0x{ctx.Eax:08X}")
-
-                p_if_index_memory = self.pending_second_break_tids.pop(tid)
-                free_memory(h_process, p_if_index_memory)
-                self.pending_single_step_tids.add(tid)
+                log_level = logging.ERROR if ctx.Eax == DWORD(-1) else logging.INFO
+                logger.log(log_level, "%s", f"setsockopt result: 0x{ctx.Eax:08X}")
+                process.pending_single_step_tids.add(tid)
             else:
+                if exception_code != EXCEPTION_BREAKPOINT:
+                    raise RuntimeError(f"Unknown exception: {exception_code = :08x}")
+                logger.info("[red]%s[/]", f"Breakpoint #1 [{tid = }]")
                 s_value: bytes = read_process_memory(
                     h_process, ctx.Esp + sizeof(DWORD), sizeof(DWORD)
                 )
                 p_if_index_memory = alloc_memory(h_process, SIZE_T(sizeof(DWORD)))
+                process.pending_second_break_tids[tid] = p_if_index_memory
                 if typing.TYPE_CHECKING:
                     assert p_if_index_memory.value is not None
+                    assert process.if_index is not None
                 if_index = struct.pack("!I", process.if_index & 0xFFFFFF)
                 write_process_memory(h_process, p_if_index_memory, if_index)
 
@@ -984,88 +1062,123 @@ class Debugger:
 
                 ctx.Eip = process.functions.setsockopt.value
                 ctx.EFlags &= ~EFLAGS_TF
-
-                self.pending_second_break_tids[tid] = p_if_index_memory
             set_context(h_thread, ctx)
 
-    def debug_loop(self) -> None:  # noqa: PLR0912, PLR0915, C901
-        pids_to_debug: set[int] = set()
-        processes: dict[int, Process] = {}  # pid to process
-        debug_event = DEBUG_EVENT()
-        self.barrier.wait()
-        while True:
-            msg: Message
-            try:
-                if pids_to_debug:
-                    msg = self.queue.get(block=False)
-                else:
-                    msg = self.queue.get(timeout=0.1)
-            except queue.Empty as ex:
-                if not pids_to_debug:
-                    continue
-                timeout = DWORD(100)  # milliseconds
-                if not WaitForDebugEvent(byref(debug_event), timeout):
-                    last_error = ctypes.get_last_error()
-                    if last_error == winerror.ERROR_SEM_TIMEOUT:
-                        continue
-                    raise ctypes.WinError(last_error) from None
-                pid = debug_event.dwProcessId
-                if pid not in pids_to_debug:
-                    continue
-                tid = debug_event.dwThreadId
-                process = processes[pid]
-                event_code = debug_event.dwDebugEventCode
-                continue_status = DBG_CONTINUE
-                if event_code == win32con.CREATE_PROCESS_DEBUG_EVENT:
-                    logger.debug("%s", "CREATE_PROCESS_DEBUG_EVENT")
-                    create_process_info = debug_event.u.CreateProcessInfo
-                    process.h_process = create_process_info.hProcess
-                    process.h_thread = create_process_info.hThread
-                    process.image_file = create_process_info.hFile
-                elif event_code == win32con.CREATE_THREAD_DEBUG_EVENT:
-                    logger.debug("%s", "CREATE_THREAD_DEBUG_EVENT")
-                    process.threads[tid] = debug_event.u.CreateThread.hThread
-                elif event_code == win32con.EXCEPTION_DEBUG_EVENT:
-                    logger.debug("%s", "EXCEPTION_DEBUG_EVENT")
-                    exception = debug_event.u.Exception
-                    exception_record = exception.ExceptionRecord
-                    exception_code = exception_record.ExceptionCode  # noqa: F841
-                    exception_address = exception_record.ExceptionAddress
-                    if typing.TYPE_CHECKING:
-                        assert process.functions.connect.value is not None
-                    max_instr_sz = 8
-                    offset = exception_address - process.functions.connect.value
-                    if 0 <= offset < max_instr_sz:
-                        self.handle_connect_break(process, tid)
-                    else:
-                        continue_status = DBG_EXCEPTION_NOT_HANDLED
-                elif event_code == win32con.EXIT_PROCESS_DEBUG_EVENT:
-                    logger.debug("%s", "EXIT_PROCESS_DEBUG_EVENT")
-                    exit_process = debug_event.u.ExitProcess
-                    process.exit_code = exit_process.dwExitCode
-                    if process.image_file.value is not None:
-                        _check(CloseHandle(process.image_file), ex)
-                elif event_code == win32con.EXIT_THREAD_DEBUG_EVENT:
-                    logger.debug("%s", "EXIT_THREAD_DEBUG_EVENT")
-                    exit_code = debug_event.u.ExitThread.dwExitCode  # noqa: F841
-                    h_thread = process.threads.pop(tid)
-                elif event_code == win32con.LOAD_DLL_DEBUG_EVENT:
-                    logger.debug("%s", "LOAD_DLL_DEBUG_EVENT")
-                    self.handle_load_dll(process, debug_event.u.LoadDll)
-                elif event_code == win32con.UNLOAD_DLL_DEBUG_EVENT:
-                    logger.debug("%s", "LOAD_DLL_DEBUG_EVENT")
-                    self.handle_unload_dll(process, debug_event.u.UnloadDll)
-                elif event_code == win32con.OUTPUT_DEBUG_STRING_EVENT:
-                    logger.debug("%s", "OUTPUT_DEBUG_STRING_EVENT")
-                elif event_code == win32con.RIP_EVENT:
-                    logger.debug("%s", "RIP_EVENT")
-                else:
-                    raise AssertionError(f"{event_code = }") from None
-                _check(ContinueDebugEvent(pid, debug_event.dwThreadId, continue_status))
+    def handle_debug_string(
+        self, process: Process, debug_string_info: OUTPUT_DEBUG_STRING_INFO
+    ) -> None:
+        with (
+            open_process(process.pid) as h_process,
+        ):
+            addr = debug_string_info.lpDebugStringData
+            length = debug_string_info.nDebugStringLength
+            assert addr
+            assert length > 0, f"{length = }"
+            debug_string: str
+            if debug_string_info.fUnicode:
+                # UTF-16LE: length is in WCHARs
+                byte_count = length * 2
+                data = read_process_memory(h_process, addr, byte_count)
+                debug_string = data.decode("utf-16-le", errors="replace")
             else:
-                try:
-                    if msg.cmd == Command.RUN_PROCESS:
-                        token, args, if_index = msg.payload
+                # ANSI: length is in bytes; decode with system ANSI code page
+                byte_count = length
+                data = read_process_memory(h_process, addr, byte_count)
+                # 'mbcs' uses the Windows ANSI code page (CP_ACP)
+                debug_string = data.decode("mbcs", errors="replace")
+            logger.info("%s", f"{debug_string = }")
+
+    def _debug_iteration(  # noqa: PLR0912, PLR0915, C901
+        self,
+        pids_to_debug: set[int],
+        processes: dict[int, Process],
+        debug_event: DEBUG_EVENT,
+    ) -> bool:
+        msg: Message
+        try:
+            if pids_to_debug:
+                msg = self.queue.get(block=False)
+            else:
+                msg = self.queue.get(timeout=0.1)
+        except queue.Empty:
+            if not pids_to_debug:
+                return True
+            timeout = DWORD(100)  # milliseconds
+            if not WaitForDebugEvent(byref(debug_event), timeout):
+                last_error = ctypes.get_last_error()
+                if last_error == winerror.ERROR_SEM_TIMEOUT:
+                    return True
+                raise ctypes.WinError(last_error) from None
+            pid = debug_event.dwProcessId
+            if pid not in pids_to_debug:
+                return True
+            tid = debug_event.dwThreadId
+            process: Process = processes[pid]
+            event_code = debug_event.dwDebugEventCode
+            continue_status = DBG_CONTINUE
+            log_level = logging.INFO
+            if event_code == win32con.CREATE_PROCESS_DEBUG_EVENT:
+                logger.log(log_level, "%s", "CREATE_PROCESS_DEBUG_EVENT")
+                create_process_info = debug_event.u.CreateProcessInfo
+                process.h_process = create_process_info.hProcess
+                process.h_thread = create_process_info.hThread
+                process.image_file = create_process_info.hFile
+            elif event_code == win32con.CREATE_THREAD_DEBUG_EVENT:
+                logger.log(log_level, "%s", f"CREATE_THREAD_DEBUG_EVENT {tid = }")
+                process.threads[tid] = debug_event.u.CreateThread.hThread
+            elif event_code == win32con.EXCEPTION_DEBUG_EVENT:
+                logger.log(log_level, "%s", "EXCEPTION_DEBUG_EVENT")
+                exception = debug_event.u.Exception
+                first_chance = exception.dwFirstChance
+                exception_record = exception.ExceptionRecord
+                exception_code = exception_record.ExceptionCode
+                exception_address = exception_record.ExceptionAddress
+                if typing.TYPE_CHECKING:
+                    assert process.functions.connect.value is not None
+                logger.info(
+                    "%s",
+                    "Exception"
+                    f" {tid = }"
+                    f" {exception_address = :08X}"
+                    f" {first_chance = }"
+                    f" {process.functions.connect.value = :08X}"
+                    f" {exception_code = :08X}",
+                )
+                offset = exception_address - process.functions.connect.value
+                if 0 <= offset <= MAX_INSTR_SZ:
+                    self.handle_connect_break(
+                        process, tid, exception_code, exception_address
+                    )
+                else:
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED
+            elif event_code == win32con.EXIT_PROCESS_DEBUG_EVENT:
+                logger.log(log_level, "%s", "EXIT_PROCESS_DEBUG_EVENT")
+                exit_process = debug_event.u.ExitProcess
+                process.exit_code = exit_process.dwExitCode
+            elif event_code == win32con.EXIT_THREAD_DEBUG_EVENT:
+                logger.log(log_level, "%s", f"EXIT_THREAD_DEBUG_EVENT {tid = }")
+                exit_code = debug_event.u.ExitThread.dwExitCode  # noqa: F841
+                process.threads.pop(tid)
+            elif event_code == win32con.LOAD_DLL_DEBUG_EVENT:
+                logger.log(log_level, "%s", "LOAD_DLL_DEBUG_EVENT")
+                self.handle_load_dll(process, debug_event.u.LoadDll)
+            elif event_code == win32con.UNLOAD_DLL_DEBUG_EVENT:
+                logger.log(log_level, "%s", "LOAD_DLL_DEBUG_EVENT")
+                self.handle_unload_dll(process, debug_event.u.UnloadDll)
+            elif event_code == win32con.OUTPUT_DEBUG_STRING_EVENT:
+                logger.log(log_level, "%s", "OUTPUT_DEBUG_STRING_EVENT")
+                self.handle_debug_string(process, debug_event.u.DebugString)
+            elif event_code == win32con.RIP_EVENT:
+                logger.log(log_level, "%s", "RIP_EVENT")
+            else:
+                raise AssertionError(f"{event_code = }") from None
+            _check(ContinueDebugEvent(pid, debug_event.dwThreadId, continue_status))
+        else:
+            try:
+                logger.info("%s", f"{msg.cmd = }")
+                if msg.cmd == Command.RUN_PROCESS:
+                    token, args, if_index = msg.payload
+                    try:
                         creationflags: int = win32con.CREATE_SUSPENDED
                         proc: subprocess.Popen[str] = subprocess.Popen(  # noqa: S603
                             args,
@@ -1073,95 +1186,80 @@ class Debugger:
                             cwd=Path(args[0]).parent,
                             text=True,
                         )
-                        with open_process(proc.pid) as h_process:
-                            process_bitness = get_process_bitness(h_process)
-                            if process_bitness != 32:  # noqa: PLR2004
-                                raise RuntimeError(
-                                    f"{process_bitness}-bit debugee is not supported"
-                                )
-                            threads = psutil.Process(pid=proc.pid).threads()
-                            if len(threads) != 1:
-                                raise AssertionError(f"{len(threads) = }")
-                            tid = threads[0].id
-                            with open_thread(tid) as h_thread:
-                                process = Process(
-                                    pid=proc.pid,
-                                    token=token,
-                                    if_index=if_index,
-                                )
-                                dll_name = b"ws2_32.dll"
-                                h_module = load_library(h_process, dll_name)
-                                functions = ("connect", "setsockopt")
-                                (
-                                    process.functions.connect,
-                                    process.functions.setsockopt,
-                                ) = get_export_addresses(
-                                    h_module, dll_name, *(f.encode() for f in functions)
-                                )
-                                process.h_module[dll_name] = h_module
-                                process.orig_code = read_process_memory(
-                                    h_process, process.functions.connect, len(INT3)
-                                )
-                                _check(ResumeThread(h_thread))
+                        try:
+                            process = self.setup_process(proc.pid, token, if_index)
+                        except Exception:
+                            self.terminate_proc(proc)
+                            raise
                         processes[proc.pid] = process
-                        msg.result = (proc,)
-                    elif msg.cmd == Command.START_DEBUG:
-                        (proc,) = msg.payload
-                        pids_to_debug.add(proc.pid)
-                        process = processes[proc.pid]
-                        with open_process(proc.pid) as h_process:
-                            write_process_memory(
-                                h_process, process.functions.connect, INT3
-                            )
-                        _check(DebugActiveProcess(proc.pid))
-                    elif msg.cmd == Command.STOP_DEBUG:
-                        (proc,) = msg.payload
-                        pids_to_debug.remove(proc.pid)
-                        process = processes[proc.pid]
-                        with open_process(proc.pid) as h_process:
-                            write_process_memory(
-                                h_process, process.functions.connect, process.orig_code
-                            )
-                        _check(DebugActiveProcessStop(proc.pid))
-                    elif msg.cmd == Command.TERMINATE_PROCESS:
-                        (proc,) = msg.payload
-                        process = processes.pop(proc.pid)
-                        if proc.returncode is None:
-                            try:
-                                logger.info("Terminate process...")
-                                proc.terminate()
-                            except ProcessLookupError:
-                                logger.info("Subprocess exited on its own")
-                            else:
-                                returncode = proc.wait()
-                                logger.info(
-                                    "%s", f"Subprocess terminated: {returncode = }"
-                                )
-                    elif msg.cmd == Command.STOP:
-                        # TODO(tomilov): cleanup pids_to_debug and processes?
-                        break
-                    else:
-                        raise AssertionError(f"{msg.cmd = }")
-                finally:
-                    msg.done.set()
-                    self.queue.task_done()
+                        msg.result = (proc, None)
+                    except Exception as ex:
+                        msg.result = (None, ex)
+                elif msg.cmd == Command.START_DEBUG:
+                    (proc,) = msg.payload
+                    process = processes[proc.pid]
+                    with open_process(proc.pid) as h_process:
+                        code = INT3
+                        write_process_memory(h_process, process.functions.connect, code)
+                    _check(DebugActiveProcess(proc.pid))
+                    pids_to_debug.add(proc.pid)
+                elif msg.cmd == Command.STOP_DEBUG:
+                    (proc,) = msg.payload
+                    process = processes[proc.pid]
+                    with open_process(proc.pid) as h_process:
+                        code = process.orig_code
+                        write_process_memory(h_process, process.functions.connect, code)
+                    _check(DebugActiveProcessStop(proc.pid))
+                    pids_to_debug.remove(proc.pid)
+                elif msg.cmd == Command.TERMINATE_PROCESS:
+                    (proc,) = msg.payload
+                    process = processes.pop(proc.pid)
+                    process.cleanup()
+                    self.terminate_proc(proc)
+                elif msg.cmd == Command.STOP:
+                    return False
+                else:
+                    raise AssertionError(f"{msg.cmd = }")
+            finally:
+                msg.done.set()
+                self.queue.task_done()
+        return True
+
+    def debug_loop(self) -> None:
+        pids_to_debug: set[int] = set()
+        processes: dict[int, Process] = {}  # pid to process
+        debug_event = DEBUG_EVENT()
+        self.barrier.wait()
+        try:
+            while self._debug_iteration(pids_to_debug, processes, debug_event):
+                pass
+        except BaseException:
+            logger.exception("%s", "debug_loop broken")
+            self.queue.shutdown()
+        finally:
+            for process in processes.values():
+                process.cleanup()
+            for pid in pids_to_debug:
+                _check(DebugActiveProcessStop(pid))
 
     @contextlib.contextmanager
     def run_process(
         self, token: str, args: list[str], *, if_index: int | None = None
     ) -> Generator[subprocess.Popen[str]]:
-        result = self.send(
+        proc: subprocess.Popen[str] | None
+        ex: BaseException | None
+        (proc, ex) = self.send(
             cmd=Command.RUN_PROCESS,
             payload=(token, args, if_index),
         )
+        if proc is None:
+            raise ex
         try:
-            if typing.TYPE_CHECKING:
-                assert isinstance(result[0], subprocess.Popen)
-            yield result[0]
+            yield proc
         finally:
             self.send(
                 cmd=Command.TERMINATE_PROCESS,
-                payload=(result[0],),
+                payload=(proc,),
             )
 
     @contextlib.contextmanager

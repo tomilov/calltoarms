@@ -204,3 +204,7 @@ async def make_asynccontextmanager[T](
             raise
     else:
         await loop.run_in_executor(executor, cm.__exit__, None, None, None)
+
+
+def raise_assert(message: str, ex: BaseException | None = None) -> None:
+    raise AssertionError(message) from ex

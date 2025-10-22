@@ -61,9 +61,11 @@ class TaskManager:
         self, token: str, args: list[str], *, if_index: int | None = None
     ) -> AsyncGenerator[subprocess.Popen[str]]:
         process: subprocess.Popen[str]
-        async with util.make_asynccontextmanager(
-            self.debugger.run_process(token, args, if_index=if_index)
-        ) as process:
+        async with (
+            util.make_asynccontextmanager(
+                self.debugger.run_process(token, args, if_index=if_index)
+            ) as process,
+        ):
             yield process
             process_task = self.tg.create_task(
                 asyncio.to_thread(process.wait), name=f"wait {token}"
@@ -107,6 +109,7 @@ class TaskManager:
                 break
         try:
             callback("process_created")
+            process: subprocess.Popen[str]
             async with (
                 self.login_semaphore,
                 self._run_process(token, args, if_index=if_index) as process,
@@ -120,10 +123,10 @@ class TaskManager:
                 async with self.lock:
                     self.windows[token] = window
                 callback("window_appeared")
-                cm = (
-                    util.make_asynccontextmanager(self.debugger.debug(process))
-                    if if_index is not None
-                    else contextlib.nullcontext()
+                cm: contextlib.AbstractAsyncContextManager[None] = (
+                    contextlib.nullcontext()
+                    if if_index is None
+                    else util.make_asynccontextmanager(self.debugger.debug(process))
                 )
                 async with cm:
                     if await window.login(login, password, fast_relogin=fast_relogin):
@@ -131,6 +134,8 @@ class TaskManager:
                     else:
                         callback("login_failed")
                 self.login_semaphore.release()
+        except Exception:
+            logger.exception("%s", "Running process failed")
         finally:
             callback("process_exited")
             async with self.lock:
@@ -138,6 +143,7 @@ class TaskManager:
                 self.processes.pop(token, None)
 
     async def resize_window_to_work_area(self) -> None:
+        window: Window
         async with self.lock:
             for window in self.windows.values():
                 if window.is_top_level_window():
@@ -147,6 +153,7 @@ class TaskManager:
         await window.resize_window_to_work_area()
 
     async def make_topmost_and_focus(self, token: str) -> None:
+        window: Window | None
         async with self.lock:
             window = self.windows.get(token)
         if window is not None:

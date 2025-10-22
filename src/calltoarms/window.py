@@ -211,7 +211,7 @@ class Window:
         text_to_type: str,
         *,
         confidence: float,
-        timeout: float,
+        timeout: float,  # noqa: ASYNC109
         delay: float,
     ) -> None:
         await self.find_and_click_image(
@@ -252,6 +252,7 @@ class Window:
     async def login(
         self, login: str | None, password: str | None, *, fast_relogin: bool | None
     ) -> bool:
+        logger.info("%s", "logging sequence started")
         try:
             async with asyncio.TaskGroup() as tg:
                 login_conditions_task = tg.create_task(
@@ -268,10 +269,12 @@ class Window:
         except* Exception as eg:
             for ex in eg.exceptions:
                 logger.exception(
-                    "%s", f"Failed to login to the window '{self.window.title}': {ex}"
+                    "%s", f"Failed to login to '{self.window.title}': {ex}"
                 )
         else:
+            logger.info("%s", "logging sequence successfully finished")
             return True
+        logger.info("%s", "logging sequence failed")
         return False
 
 

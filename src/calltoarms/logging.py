@@ -4,7 +4,11 @@ import logging
 import logging.handlers
 from collections.abc import Generator
 
-from . import console, util
+from rich.console import Console
+from rich.logging import RichHandler
+
+from . import util
+from .console import make_console
 
 
 def setup_parser_logging(parser: argparse.ArgumentParser) -> None:
@@ -30,9 +34,11 @@ def setup_logging(app_name: str, verbosity: int, quiet: bool) -> Generator[None]
     level = log_levels.get(verbosity, logging.DEBUG)
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
+    logging.getLogger("flet").setLevel(logging.WARNING)
+    logging.getLogger("flet_desktop").setLevel(logging.WARNING)
     root_logger.handlers.clear()
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     log_file = util.get_base_path() / f"{app_name}.log"
     file_handler = logging.handlers.TimedRotatingFileHandler(log_file, when="midnight")
@@ -40,9 +46,22 @@ def setup_logging(app_name: str, verbosity: int, quiet: bool) -> Generator[None]
     root_logger.addHandler(file_handler)
     if quiet:
         yield
-    else:
-        with console.console() if util.is_frozen() else contextlib.nullcontext():
-            stream_handler = logging.StreamHandler()
-            stream_handler.setFormatter(formatter)
-            root_logger.addHandler(stream_handler)
-            yield
+        return
+    cm = make_console() if util.is_frozen() else contextlib.nullcontext()
+    with cm:
+        rich_console = Console(
+            force_terminal=True,
+            color_system="truecolor",
+        )
+        rich_handler = RichHandler(
+            markup=True,
+            rich_tracebacks=True,
+            show_time=True,
+            show_level=True,
+            show_path=False,
+            log_time_format="%Y-%m-%d %H:%M:%S",
+            console=rich_console,
+        )
+        rich_handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger.addHandler(rich_handler)
+        yield

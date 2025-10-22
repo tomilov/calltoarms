@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "calltoarms"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name="Tomilov Anatoliy", email="tomilovanatoliy@gmail.com" },
 ]
@@ -18,32 +18,30 @@ classifiers = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+  "tabulate",
+  "addict",
+  "tenacity",
   "PyYAML",
   "types-PyYAML",
   "pywin32",
   "types-pywin32",
   "psutil",
   "types-psutil",
+  "wmi",
   "pyautogui",
   "types-PyAutoGUI",
+  "pygetwindow",
   "keyboard",
   "types-keyboard",
   "opencv-python",
   "Pillow",
-  "pygetwindow",
-  "aiofiles",
-  "tenacity",
-  "psutil",
-  "types-psutil",
-  "wmi",
-  "flet",
+  "flet; sys_platform == 'win32'",
   "flet-desktop; sys_platform == 'win32'",
-  "filelock",
-  "tabulate",
   "types-tabulate",
+  "filelock",
   "pydantic",
   "pydantic-settings",
-  "addict",
+  "rich",
 ]
 
 [project.urls]
@@ -79,7 +77,6 @@ select = [
   "ALL",
 ]
 ignore = [
-  "ASYNC109",
   "S101",
   "COM812",
   "TRY003",

@@ -5,7 +5,7 @@ from collections.abc import Generator
 
 
 @contextlib.contextmanager
-def console() -> Generator[None]:
+def make_console() -> Generator[None]:
     if not ctypes.windll.kernel32.AllocConsole():
         raise RuntimeError("Cannot allocate console")
     try:

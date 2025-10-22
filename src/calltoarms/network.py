@@ -34,7 +34,7 @@ def get_interfaces() -> Generator[Interface]:
             continue
         for addr in addrs:
             if addr.family == socket.AF_INET:
-                if addr.address != "127.0.0.1":
+                if addr.address != "127.0.0.1" and addr.address in adapters:
                     metric, if_index = adapters[addr.address]
                     yield Interface(
                         name=name,
