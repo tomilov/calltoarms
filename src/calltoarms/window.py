@@ -179,15 +179,16 @@ class Window:
             assert isinstance(is_active, bool)
         return is_active
 
-    async def _track_login_conditions(self) -> None:
+    async def _track_login_conditions(self) -> bool:
         while self.window.isActive:
             try:
                 await asyncio.wait_for(self.login_event.wait(), timeout=0.1)
             except TimeoutError:
                 logger.debug("%s", f"Window '{self.window.title}' focus is not lost")
             else:
-                return
-        raise RuntimeError(f"Window '{self.window.title}' focus is lost")
+                return True
+        logger.debug("%s", f"Window '{self.window.title}' focus is lost")
+        return False
 
     @util.retry_with_delay
     async def find_image(
@@ -272,9 +273,9 @@ class Window:
                     "%s", f"Failed to login to '{self.window.title}': {ex}"
                 )
         else:
-            logger.info("%s", "logging sequence successfully finished")
+            logger.info("%s", "Logging sequence successfully finished")
             return True
-        logger.info("%s", "logging sequence failed")
+        logger.info("%s", "Logging sequence failed")
         return False
 
 
