@@ -592,9 +592,23 @@ IP_UNICAST_IF = 31  # optname (DWORD IfIndex)
 EFLAGS_TF = 0x100  # EFlags Trap Flag
 
 
+def _ctype_to_int[T](value: T | int) -> int | None:
+    if isinstance(value, int):
+        return value
+    return getattr(value, "value", None)
+
+
+def _check[T](
+    condition: T, *, ex: Exception | None = None, descr: str | None = None
+) -> T:
+    if not condition:
+        raise ctypes.WinError(ctypes.get_last_error(), descr) from ex
+    return condition
+
+
 @dataclass(kw_only=True)
 class Dll:
-    image_file: HANDLE = field(default_factory=HANDLE)
+    image_file: HANDLE | int = field(default_factory=HANDLE)
 
 
 @dataclass(kw_only=True)
@@ -603,24 +617,24 @@ class Process:
     token: str
     if_index: int | None
 
-    functions: Dict[bytes, LPVOID] = field(default_factory=Dict)
+    functions: Dict[bytes, LPVOID | int] = field(default_factory=Dict)
     orig_code: bytes = b""
 
-    exit_code: DWORD | None = None
+    exit_code: DWORD | int | None = None
 
-    h_process: HANDLE = field(default_factory=HANDLE)
-    h_thread: HANDLE = field(default_factory=HANDLE)
-    h_module: dict[bytes, HANDLE] = field(default_factory=dict)
-    image_file: HANDLE = field(default_factory=HANDLE)
-    threads: dict[DWORD, HANDLE] = field(default_factory=dict)
-    dlls: dict[LPVOID, Dll] = field(default_factory=dict)  # lpBaseOfDll to hFile
+    h_process: HANDLE | int = field(default_factory=HANDLE)
+    h_thread: HANDLE | int = field(default_factory=HANDLE)
+    image_file: HANDLE | int = field(default_factory=HANDLE)
+    threads: dict[DWORD | int, HANDLE | int] = field(default_factory=dict)
+    dlls: dict[LPVOID | int, Dll] = field(default_factory=dict)  # lpBaseOfDll to hFile
 
-    pending_second_break_tids: dict[int, LPVOID] = field(default_factory=dict)
+    pending_second_break_tids: dict[int, LPVOID | int] = field(default_factory=dict)
     pending_single_step_tids: set[int] = field(default_factory=set)
 
     def cleanup(self) -> None:
-        if self.image_file.value is not None:
-            _check(CloseHandle(self.image_file))
+        image_file = _ctype_to_int(self.image_file)
+        if image_file:
+            _check(CloseHandle(image_file))
         with open_process(self.pid) as h_process:
             while self.pending_second_break_tids:
                 tid, p_if_index_memory = self.pending_second_break_tids.popitem()
@@ -631,19 +645,13 @@ class Process:
                 free_memory(h_process, p_if_index_memory)
 
 
-def _check[T](condition: T, ex: Exception | None = None, descr: str | None = None) -> T:
-    if not condition:
-        raise ctypes.WinError(ctypes.get_last_error(), descr) from ex
-    return condition
-
-
 def is_32bit_executable(path: Path) -> bool:
     bt = DWORD()
     _check(GetBinaryTypeW(str(path), byref(bt)))
     return bt.value == SCS_32BIT_BINARY
 
 
-def get_process_bitness(h_process: HANDLE) -> typing.Literal[32, 64]:
+def get_process_bitness(h_process: HANDLE | int) -> typing.Literal[32, 64]:
     if IsWow64Process2:
         pm, nm = USHORT(), USHORT()
         _check(IsWow64Process2(h_process, byref(pm), byref(nm)))
@@ -670,7 +678,7 @@ def get_process_bitness(h_process: HANDLE) -> typing.Literal[32, 64]:
 
 @contextlib.contextmanager
 def open_process(pid: int) -> Generator[HANDLE]:
-    h_process: HANDLE = _check(OpenProcess(PROCESS_ALL_ACCESS, False, pid))
+    h_process: HANDLE = _check(HANDLE(OpenProcess(PROCESS_ALL_ACCESS, False, pid)))
     try:
         yield h_process
     finally:
@@ -678,7 +686,7 @@ def open_process(pid: int) -> Generator[HANDLE]:
 
 
 @contextlib.contextmanager
-def suspend_process(h_process: HANDLE) -> Generator[None]:
+def suspend_process(h_process: HANDLE | int) -> Generator[None]:
     _check(NtSuspendProcess(h_process) >= 0)
     try:
         yield
@@ -688,7 +696,7 @@ def suspend_process(h_process: HANDLE) -> Generator[None]:
 
 @contextlib.contextmanager
 def open_thread(tid: int) -> Generator[HANDLE]:
-    h_thread: HANDLE = _check(OpenThread(THREAD_ALL_ACCESS, False, tid))
+    h_thread: HANDLE = _check(HANDLE(OpenThread(THREAD_ALL_ACCESS, False, tid)))
     try:
         yield h_thread
     finally:
@@ -705,7 +713,7 @@ def normalize_final_path(p: str) -> str:
     return p
 
 
-def get_final_path_from_handle(h_file: HANDLE) -> str:
+def get_final_path_from_handle(h_file: HANDLE | int) -> str:
     size = MAX_PATH
     flags = VOLUME_NAME_DOS | FILE_NAME_NORMALIZED
     while True:
@@ -716,7 +724,7 @@ def get_final_path_from_handle(h_file: HANDLE) -> str:
         size = n + 1
 
 
-def get_dll_name(h_process: HANDLE, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
+def get_dll_name(h_process: HANDLE | int, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
     assert h_process
     if not load_dll.lpImageName:
         return ""
@@ -724,9 +732,7 @@ def get_dll_name(h_process: HANDLE, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
     local_ptr_size = sizeof(ctypes.c_void_p)
     if remote_process_bitness == 64 and local_ptr_size == 4:  # noqa: PLR2004
         raise NotImplementedError("32-bit debugger cannot read 64-bit process")
-    p_name_ptr = (
-        ctypes.c_uint64() if remote_process_bitness == 64 else ctypes.c_uint32()  # noqa: PLR2004
-    )
+    p_name_ptr = LPVOID()
     read = SIZE_T(0)
     _check(
         ReadProcessMemory(
@@ -737,16 +743,15 @@ def get_dll_name(h_process: HANDLE, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
             byref(read),
         )
     )
-    if not p_name_ptr.value:
-        raise RuntimeError(f"{p_name_ptr.value = }")
-    name_addr = p_name_ptr.value
+    if not p_name_ptr:
+        raise RuntimeError(f"{p_name_ptr = }")
     name: str
     if load_dll.fUnicode:
         buf_w = ctypes.create_unicode_buffer(MAX_PATH)
         _check(
             ReadProcessMemory(
                 h_process,
-                LPVOID(name_addr),
+                p_name_ptr,
                 buf_w,
                 sizeof(buf_w),
                 byref(read),
@@ -758,7 +763,7 @@ def get_dll_name(h_process: HANDLE, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
         _check(
             ReadProcessMemory(
                 h_process,
-                LPVOID(name_addr),
+                p_name_ptr,
                 buf_a,
                 sizeof(buf_a),
                 byref(read),
@@ -770,19 +775,19 @@ def get_dll_name(h_process: HANDLE, load_dll: LOAD_DLL_DEBUG_INFO) -> str:
     return Path(name).name.lower()
 
 
-def alloc_memory(h_process: HANDLE, n: SIZE_T) -> LPVOID:
+def alloc_memory(h_process: HANDLE | int, n: SIZE_T | int) -> LPVOID:
     alloc_type = win32con.MEM_COMMIT | win32con.MEM_RESERVE
     prot = win32con.PAGE_READWRITE
     p_memory = LPVOID(VirtualAllocEx(h_process, None, n, alloc_type, prot))
     return _check(p_memory)
 
 
-def free_memory(h_process: HANDLE, p_memory: LPVOID) -> None:
+def free_memory(h_process: HANDLE | int, p_memory: LPVOID | int) -> None:
     _check(VirtualFreeEx(h_process, p_memory, 0, win32con.MEM_RELEASE))
 
 
 @contextlib.contextmanager
-def get_memory(h_process: HANDLE, n: SIZE_T) -> Generator[LPVOID]:
+def get_memory(h_process: HANDLE | int, n: SIZE_T | int) -> Generator[LPVOID]:
     p_memory: LPVOID = alloc_memory(h_process, n)
     try:
         yield p_memory
@@ -790,7 +795,7 @@ def get_memory(h_process: HANDLE, n: SIZE_T) -> Generator[LPVOID]:
         free_memory(h_process, p_memory)
 
 
-def load_library(h_process: HANDLE, dll_name: bytes) -> HMODULE:
+def load_library(h_process: HANDLE | int, dll_name: bytes) -> HMODULE:
     with contextlib.ExitStack() as exit_stack:
         dll_name_len = SIZE_T(len(dll_name) + 1)
         p_memory: LPVOID = exit_stack.enter_context(get_memory(h_process, dll_name_len))
@@ -809,8 +814,10 @@ def load_library(h_process: HANDLE, dll_name: bytes) -> HMODULE:
         # and in remote process are the same if remote is child process
         # created with CREATE_SUSPENDED and it is not yet resumed
         h_thread = _check(
-            CreateRemoteThread(
-                h_process, None, 0, load_library_ptr, p_memory, 0, byref(tid)
+            HANDLE(
+                CreateRemoteThread(
+                    h_process, None, 0, load_library_ptr, p_memory, 0, byref(tid)
+                )
             )
         )
         exit_stack.callback(lambda: _check(CloseHandle(h_thread)))
@@ -822,10 +829,9 @@ def load_library(h_process: HANDLE, dll_name: bytes) -> HMODULE:
 
 
 def get_export_addresses(
-    h_module_remote: HMODULE, dll_name: bytes, *func_names: bytes
+    h_process: HANDLE, dll_name: bytes, *func_names: bytes
 ) -> Generator[LPVOID]:
-    if typing.TYPE_CHECKING:
-        assert h_module_remote.value is not None
+    h_module_remote = load_library(h_process, dll_name)
     with contextlib.ExitStack() as exit_stack:
         h_module_local = GetModuleHandleA(dll_name)
         if not h_module_local:
@@ -834,10 +840,12 @@ def get_export_addresses(
         for func_name in func_names:
             p_func_addr_local = _check(GetProcAddress(h_module_local, func_name))
             rva = DWORD(p_func_addr_local).value - DWORD(h_module_local).value
+            if typing.TYPE_CHECKING:
+                assert h_module_remote.value is not None
             yield LPVOID(DWORD(h_module_remote.value).value + rva)
 
 
-def read_process_memory(h_process: HANDLE, addr: LPVOID, n: int) -> bytes:
+def read_process_memory(h_process: HANDLE | int, addr: LPVOID | int, n: int) -> bytes:
     orig_code = (ctypes.c_ubyte * n)()
     read = SIZE_T(0)
     _check(ReadProcessMemory(h_process, addr, orig_code, n, byref(read)))
@@ -846,7 +854,9 @@ def read_process_memory(h_process: HANDLE, addr: LPVOID, n: int) -> bytes:
     return bytes(orig_code)
 
 
-def write_process_memory(h_process: HANDLE, addr: LPVOID, code: bytes) -> None:
+def write_process_memory(
+    h_process: HANDLE | int, addr: LPVOID | int, code: bytes
+) -> None:
     orig_prot = DWORD(0)
     _check(
         VirtualProtectEx(
@@ -875,14 +885,14 @@ def write_process_memory(h_process: HANDLE, addr: LPVOID, code: bytes) -> None:
         )
 
 
-def get_context(h_thread: HANDLE) -> WOW64_CONTEXT:
+def get_context(h_thread: HANDLE | int) -> WOW64_CONTEXT:
     ctx = WOW64_CONTEXT()
     ctx.ContextFlags = WOW64_CONTEXT_ALL
     _check(Wow64GetThreadContext(h_thread, byref(ctx)))
     return ctx
 
 
-def set_context(h_thread: HANDLE, ctx: WOW64_CONTEXT) -> None:
+def set_context(h_thread: HANDLE | int, ctx: WOW64_CONTEXT) -> None:
     _check(Wow64SetThreadContext(h_thread, byref(ctx)))
 
 
@@ -950,12 +960,10 @@ class Debugger:
                     if_index=if_index,
                 )
                 dll_name = b"ws2_32.dll"
-                h_module = load_library(h_process, dll_name)
                 (
                     process.functions.connect,
                     process.functions.setsockopt,
-                ) = get_export_addresses(h_module, dll_name, b"connect", b"setsockopt")
-                process.h_module[dll_name] = h_module
+                ) = get_export_addresses(h_process, dll_name, b"connect", b"setsockopt")
                 process.orig_code = read_process_memory(
                     h_process, process.functions.connect, len(INT3)
                 )
@@ -983,8 +991,10 @@ class Debugger:
         self, process: Process, unload_dll: UNLOAD_DLL_DEBUG_INFO
     ) -> None:
         dll = process.dlls.pop(unload_dll.lpBaseOfDll, None)
-        if dll is not None and dll.image_file.value is not None:
-            _check(CloseHandle(dll.image_file))
+        if dll is not None:
+            image_file = _ctype_to_int(dll.image_file)
+            if image_file:
+                _check(CloseHandle(image_file))
 
     def handle_connect_break(  # noqa: PLR0915
         self,
@@ -1021,7 +1031,11 @@ class Debugger:
                 ctx.Eip = process.functions.connect.value
                 ctx.EFlags |= EFLAGS_TF  # arm single-step
 
-                log_level = logging.ERROR if ctx.Eax == DWORD(-1) else logging.INFO
+                log_level = (
+                    logging.ERROR
+                    if DWORD(ctx.Eax).value == DWORD(-1).value
+                    else logging.INFO
+                )
                 logger.log(log_level, "%s", f"setsockopt result: 0x{ctx.Eax:08X}")
                 process.pending_single_step_tids.add(tid)
             else:
@@ -1129,18 +1143,18 @@ class Debugger:
             elif event_code == win32con.EXCEPTION_DEBUG_EVENT:
                 logger.log(log_level, "%s", "EXCEPTION_DEBUG_EVENT")
                 exception = debug_event.u.Exception
-                first_chance = exception.dwFirstChance
+                first_chance = DWORD(exception.dwFirstChance).value
                 exception_record = exception.ExceptionRecord
-                exception_code = exception_record.ExceptionCode
-                exception_address = exception_record.ExceptionAddress
+                exception_code = DWORD(exception_record.ExceptionCode).value
+                exception_address = DWORD(exception_record.ExceptionAddress).value
                 if typing.TYPE_CHECKING:
                     assert process.functions.connect.value is not None
                 logger.info(
                     "%s",
                     "Exception"
                     f" {tid = }"
-                    f" {exception_address = :08X}"
                     f" {first_chance = }"
+                    f" {exception_address = :08X}"
                     f" {process.functions.connect.value = :08X}"
                     f" {exception_code = :08X}",
                 )
@@ -1171,7 +1185,7 @@ class Debugger:
             elif event_code == win32con.RIP_EVENT:
                 logger.log(log_level, "%s", "RIP_EVENT")
             else:
-                raise AssertionError(f"{event_code = }") from None
+                util.raise_assert(f"{event_code = }")
             _check(ContinueDebugEvent(pid, debug_event.dwThreadId, continue_status))
         else:
             try:
@@ -1218,8 +1232,6 @@ class Debugger:
                     self.terminate_proc(proc)
                 elif msg.cmd == Command.STOP:
                     return False
-                else:
-                    raise AssertionError(f"{msg.cmd = }")
             finally:
                 msg.done.set()
                 self.queue.task_done()
@@ -1233,7 +1245,7 @@ class Debugger:
         try:
             while self._debug_iteration(pids_to_debug, processes, debug_event):
                 pass
-        except BaseException:
+        except Exception:
             logger.exception("%s", "debug_loop broken")
             self.queue.shutdown()
         finally:
