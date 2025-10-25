@@ -61,11 +61,9 @@ class TaskManager:
         self, token: str, args: list[str], *, if_index: int | None = None
     ) -> AsyncGenerator[subprocess.Popen[str]]:
         process: subprocess.Popen[str]
-        async with (
-            util.make_asynccontextmanager(
-                self.debugger.run_process(token, args, if_index=if_index)
-            ) as process,
-        ):
+        async with util.make_asynccontextmanager(
+            self.debugger.run_process(token, args, if_index=if_index)
+        ) as process:
             yield process
             process_task = self.tg.create_task(
                 asyncio.to_thread(process.wait), name=f"wait {token}"
@@ -88,7 +86,7 @@ class TaskManager:
                 try:
                     await process_task
                 except asyncio.CancelledError:
-                    print("cancelled")
+                    logger.info("%s", "Process waiting task is cancelled")
 
     @_taskgroup_task
     async def run_process(  # noqa: PLR0913
@@ -166,7 +164,8 @@ class TaskManager:
             with Debugger.run_debugger() as debugger:
                 stop_event: asyncio.Event = asyncio.Event()
                 stop_event_task = tg.create_task(stop_event.wait())
+                task_manager = cls(tg, stop_event, stop_event_task, debugger)
                 try:
-                    yield cls(tg, stop_event, stop_event_task, debugger)
+                    yield task_manager
                 finally:
                     stop_event.set()

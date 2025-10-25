@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 from tabulate import tabulate
 
+from . import util
 from .logging import setup_logging, setup_parser_logging
 from .settings import Account, Settings, setup_parser_settings
 from .task_manager import TaskManager
@@ -60,7 +61,7 @@ async def _cmd_ls(args: argparse.Namespace) -> None:
     elif args.format == "yaml":
         print(yaml.dump(settings.model_dump()))
     else:
-        raise AssertionError(f"{args.format}")
+        util.raise_assert(f"{args.format}")
 
 
 async def _cmd_run(args: argparse.Namespace) -> None:

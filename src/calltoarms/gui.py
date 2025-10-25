@@ -154,7 +154,7 @@ class CallToArmsApp:
                         run_button.tooltip = "Run"
                         run_button.on_click = lambda _: page.run_task(run)
                     else:
-                        raise AssertionError(f"{progress = }")
+                        util.raise_assert(f"{progress = }")
                     run_button.update()
 
                 nonlocal token
@@ -347,9 +347,9 @@ class CallToArmsApp:
                 elif page.platform_brightness == ft.Brightness.DARK:
                     page.theme_mode = ft.ThemeMode.DARK
                 else:
-                    raise AssertionError(f"{page.platform_brightness = }")
+                    util.raise_assert(f"{page.platform_brightness = }")
             else:
-                raise AssertionError(f"{page.theme_mode = }")
+                util.raise_assert(f"{page.theme_mode = }")
             control.icon = (
                 ft.Icons.LIGHT_MODE
                 if page.theme_mode == ft.ThemeMode.DARK

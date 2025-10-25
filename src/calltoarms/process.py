@@ -1171,7 +1171,7 @@ class Debugger:
             elif event_code == win32con.RIP_EVENT:
                 logger.log(log_level, "%s", "RIP_EVENT")
             else:
-                raise AssertionError(f"{event_code = }") from None
+                util.raise_assert(f"{event_code = }")
             _check(ContinueDebugEvent(pid, debug_event.dwThreadId, continue_status))
         else:
             try:
@@ -1218,8 +1218,6 @@ class Debugger:
                     self.terminate_proc(proc)
                 elif msg.cmd == Command.STOP:
                     return False
-                else:
-                    raise AssertionError(f"{msg.cmd = }")
             finally:
                 msg.done.set()
                 self.queue.task_done()
